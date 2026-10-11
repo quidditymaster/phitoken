@@ -89,7 +89,7 @@ special_symbols = {
             #"facet-name":surface-value
             "raw-text":
         }"[sep]",),
-    "pad":phit.SpecialSymbol(surface="[pad]",)
+    "pad":phit.SpecialSymbol(textual_surface="[pad]",)
 }
 
 
@@ -102,7 +102,7 @@ max_tok_size = 5
 vocab_size = 2**15
 oov_penalty = 1e6
 
-ref_model = phit.MarkovModel(
+ref_model = phit.sequence_models.MarkovModel(
     order = max_tok_size + fixed_left_ctxt_width,
     max_nodes = 2**20,
 )
@@ -166,12 +166,10 @@ def get_key_count_arrays(
         keys.append(key)
         values[kidx] = cdict[key]
 
-    keys = np.asarray(keys)
-
     if sorted:
         order_sign = -1 if descending else 1
         sidxs = np.argsort(order_sign*values)
-        keys = keys[sidxs]
+        keys = [keys[si] for si in sidxs]
         values = values[sidxs]
 
     if not top_k is None:
@@ -194,15 +192,14 @@ vocab_penalty = phit.ScoreLookup(
 
 vocab_enforced_phi = phi_fn + vocab_penalty
 
-finite_vocab_partitioner = phit.ScoredPartitioner(
+finite_vocab_partitioner = phit.PartitionOptimizer(
     score_fn=vocab_enforced_phi,
-    minimize = True,
-    max_lookback = max_tok_size+1,
+    max_lookback = max_tok_size,
 )
 
 #optionally re-tokenize with the new score and get a measure of divergence
 #want the divergence of the new vocabulary enforced token distribution wrt the old vocabulary free distribution 
-restricted_freq_model = phit.MarkovModel(
+restricted_freq_model = phit.sequence_models.MarkovModel(
     order = 2,
     max_nodes = 2**20,
 )
@@ -285,15 +282,13 @@ term_freq_divergence = calc_subtree_divergence(
 )
 
 
-index_lookup = phit.UniqueIndexLookup(vocabulary)
+index_lookup = phit.IndexLookup(vocabulary)
 
 tokenizer = phit.EncoderChain([
     ref_tokenizer,
     partitioner,
-    UniqueIndexLookup(vocabulary),
+    index_lookup,
 ])
-
-
 
 
 ```
