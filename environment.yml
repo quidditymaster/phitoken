@@ -6,5 +6,6 @@ dependencies:
   - numpy
   - scipy
   - pip
+  - pytest
   - pip:
       - -e .

@@ -15,5 +15,11 @@ dependencies = [
     "scipy",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.setuptools]
 packages = ["phitoken"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
