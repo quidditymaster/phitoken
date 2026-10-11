@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phitoken"
+version = "0.0.1"
+description = "A library for experimenting with tokenizers."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "Timothy Anderton"}]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[tool.setuptools]
+packages = ["phitoken"]
