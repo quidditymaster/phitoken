@@ -2,18 +2,34 @@
 
 A library for experimenting with tokenizers.
 
-partitioners transform sequences into other sequences, either by breaking the input into subsequences and/or by chunking the elements of the input sequence together into cells. Partitioners are designed to be able to be composed with each other so the input to the very first partitioner in the chain is still expected to be a list of strings instead of a single string (or a list of lists of strings if batched=True is passed) so for example 
+Tokenizers in Phitoken are built up from a sequence of composable transform stages. 
 
-different kinds of transforms
+A typical modern tokenizer might split text into its constituent bytes in UTF8, then use the BPE merging algorithm to merge bytes into subwords or tokens, and finally those tokens are turned into integer ids between zero and a preselected vocabulary size. In Phitoken that might look something like the following. 
 
-partitioners split sequences into subsequences or merge elements together 
+```Python
+import phitoken as phit
 
-maps take single nodes and transform them into other nodes via an elementwise transform
+#document separator object
+docsep = phit.SpecialSymbol(textual_surface="[next-doc-start]")
 
-multifacet transforms bring multiple facets together into a single facet node
+tokenizer = phit.EncoderChain(
+    [
+        phit.ByteSplitter(encoding="UTF8"),
+        phit.PartitionOptimizer(
+            score_fn,
+            max_chunk_size = 4,
+        ),
+        phit.IndexLookup(vocab_size=2**14, ),
+    ]
+)
+
+document = [docsep, "some text", docsep]
+
+ids = tokenizer.encode(document)
+
+```
 
 
-Special symbols should usually get passed through without being changed. 
 
 
 ```Python
@@ -27,27 +43,18 @@ im_start = SpecialSymbol(
 
 fg = encoder_chain(
     [
-        {"text":UTF8BytePartitioner()},
-        ScoredPartitioner(score_fn, max_chunk_size=4),
-        ScoredPartitioner(score_fn, max_chunk_size=4),
-        {UniqueValueIndexer(
+        UTF8ByteSplitter(),
+        PartitionOptimizer(score_fn, max_chunk_size=4),
+        PartitionOptimizer(score_fn, max_chunk_size=4),
+        IndexLookup(
             reserved_special=16,
             vocab_size=4096,
             special_passthrough = False,
-            merge_
-        ):"symbol_indexes"}
+        ),
     ]
 )
 
 train_data = get_data()
-
-#sequentially_train
-begin by training any source data
-
-utf8_enc.fit(train_data)--> no op?
-sp1.fit()
-value_indexer.fit() #pass the output of the stack up to present into the next 
-
 
 fg.encode(
     [separator_symbol, "some sorta text", separator_symbol]
@@ -63,120 +70,11 @@ fg.encode(
 [separator_symbol, [((1, 2), (3,)), ((4, 5, 6), (7, 8)), ...], separator_symbol]
 
 #value indexer output
-[, 22, 57, 63, 126, 10, ..., 0]
-
-
-
-fg = FacetGraph(
-    {
-        "facet_alias":Facet(),
-        "raw_text":Facet(),
-    }
-)
-
-fg.add_edge(
-    u = alias_or_node, 
-    v = alias_or_node, 
-    transform_fn_or_encoder_decoder_object,
-)
-
-
-fg.add_edge(
-    u="raw_text",
-    v=Facet(),
-    transform=UTF8BytePartitioner(),
-)
+[0, [22, 57, 63, 126, 10, ...,] 0]
 
 
 ```
 
-facet graphs are objects which keep track of chains of transformations between different ways of representing a piece of text and/or any metadata.
-
-
-
-tokenizer stages;
-- sanitize
-- escape control symbols
-- 
-
-
-```Python
-import phitoken as phit
-
-tokenizer = phit.load_tokenizer(
-    "path-to-file/some-tokenizer-name.json"
-)
-
-tokenizer.encode(
-    "transform this text into some sort of other standard format",
-)
-
-```
-
-
-```Python
-fg = FacetGraph()
-
-```
-
-
-What do we want with respect to special token handling? 
-
-when encoding and running for training purposes we MAY want to be able to detect special token surfaces and turn them into their appropriate special symbols in the pipeline. 
-
-when training and encoding we may want to enable detection and "promotion" of special symbols.
-But most likely we will want to inject the special symbols in an artificial way as part of the training pipeline.
-
-
-possible desirable behaviors;
-
-* Detect surface values and turn those surface values into the associated special symbol at the top of the tokenization pipeline, then  protect those special symbols from being joined into compound symbols in downstream partitioning, finally for outputting tokens we may want to control/assign specific id values/(co)surfaces.
-
-* ignore surface values of special symbols, add in special symbols via a template (e.g. put a separator token )
-
-
-
-maybe when special symbols are involved we simply ignore the imperative to make the transformation between text space and id space invertible. 
-
-tok.encode(text) -> map from the default input_facet to the default output_facet which is probably mapping from raw-text to a space of symbol ids.
-
-tok.encode(
-    text,
-    from_facet="raw-text",
-    to_facet="",
-    special_behavior=["encode", "escape" "ignore", "raise"],
-)
-
-tok.decode(
-    symbols,
-
-)
-
-tok.decode(symbol seq, restricted_symbols)
-
-encoding
-text -> symbol sequence
-
-decoding
-symbol sequence -> text 
-
-The special symbols are symbols for which there is no corresponding textual surface. 
-likewise at decoding time the special symbols might best be interpreted as control sequences which ask for some kind of special alteration in the generated text. 
-
-For example a "Document Separator" symbol could be injected at at the beginning or end of a training sequence automatically on encoding, and the second separator in a generated decoded document could potentially automatically truncate the output. 
-
-
-```Python
-import numpy as np
-
-doc_sep = phit.SpecialSymbol().add_surface_value(
-    facet = "raw-text", 
-    value = "[sep]",
-)
-
-
-
-```
 
 
 
@@ -195,9 +93,7 @@ special_symbols = {
 }
 
 
-
-
-ref_tokenizer = phit.UTF8ByteTokenizer()
+ref_tokenizer = phit.ByteSplitter(encoding="UTF8")
 
 train_corpus = get_training_data()
 
@@ -243,10 +139,9 @@ postfix_entropy = phit.ScoreFn(calc_postfix_entropy)(full_seq = full_arg, seq_mo
 phi_fn = cell_info + 2.0*postfix_entropy
 
 
-free_partitioner = phit.ScoredPartitioner(
+free_partitioner = phit.PartitionOptimizer(
     score_fn=phi_fn,
-    minimize=True,
-    max_lookback=max_tok_size+1,
+    max_chunk_size=max_tok_size,
 )
 
 #run through the training data tokenizing into an initially unlimited vocabulary 
@@ -392,7 +287,7 @@ term_freq_divergence = calc_subtree_divergence(
 
 index_lookup = phit.UniqueIndexLookup(vocabulary)
 
-tokenizer = phit.TokenizerStack([
+tokenizer = phit.EncoderChain([
     ref_tokenizer,
     partitioner,
     UniqueIndexLookup(vocabulary),
