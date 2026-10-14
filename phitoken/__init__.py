@@ -5,3 +5,10 @@ from .partition_optimization import PartitionOptimizer
 from .index_lookup import IndexLookup
 from .encoder_chain import EncoderChain
 from .scoring import Score, ScoreArg, ScoreFn, ScoreLookup
+from .markov import (
+    MarkovNode,
+    MarkovModel,
+    SlidingWindowSampler,
+    NovelSubsequenceSampler,
+    LongestMatchingPrefixEstimator,
+)

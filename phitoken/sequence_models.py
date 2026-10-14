@@ -77,7 +77,7 @@ class OnlineLinearRegression(object):
         self._t += 1
 
 
-class MarkovNode(object):
+class EntropyTrackingNode(object):
 
     def __init__(
             self,
@@ -103,6 +103,8 @@ class MarkovNode(object):
             self.ent_sums.append(gamma*logfn(gamma/cardinality_prior))
             self.singleton_counts.append(0)
 
+    def __repr__(self):
+        return f"Node(N = {self.N} )"
 
     def get(self, item, fallback=None):
         if item in self.children:
@@ -113,13 +115,13 @@ class MarkovNode(object):
     def __getitem__(self, index):
         return self.children[index]
     
-    def update(self, seq, amount=1, node_list=[]):
+    def update(self, seq, node_list=None):
         path = [self]
         for symbol in seq:
             current = path[-1]
             next = current.get(symbol)
             if next is None:
-                next = MarkovNode(
+                next = EntropyTrackingNode(
                     parent=current,
                     symbol=symbol,
                     N=0,
@@ -128,7 +130,8 @@ class MarkovNode(object):
                     branch_depth=self.branch_depth,
                 )
                 current.children[symbol] = next
-                node_list.append(next)
+                if node_list is not None:
+                    node_list.append(next)
             path.append(next)
         
         #update the continuation entropy estimates for each depth
@@ -136,7 +139,7 @@ class MarkovNode(object):
             depth = depth_idx + 1
             for node_idx, node in enumerate(path[:-depth]):
                 downstream_node = path[node_idx+depth]
-                sum_delta = _clogc(downstream_node.N + amount) - _clogc(downstream_node.N)
+                sum_delta = _clogc(downstream_node.N + 1) - _clogc(downstream_node.N)
                 node.ent_sums[depth_idx] += sum_delta
                 if downstream_node.N == 0:
                     #this node is fresh and so will become a singleton on the count update step.
@@ -147,7 +150,7 @@ class MarkovNode(object):
 
         #then increment the counts for all nodes along the path
         for node in path:
-            node.N += amount
+            node.N += 1
     
     # def update(self, seq, amount=1, node_list=[]):
     #     self.N += amount
@@ -205,7 +208,7 @@ def deletion_score(node):
     return -1*node.neff*distortion
 
 
-class MarkovModel(object):
+class XentMixingMarkovModel(object):
 
     def __init__(
         self, 
@@ -213,13 +216,11 @@ class MarkovModel(object):
         gamma=1.0,
         vocab_prior=1000,
         max_nodes=2**24,
-        start_symbol="",
-        stop_symbol="",
         entropy_branch_depth=1,
     ):
         assert entropy_branch_depth >= 0
 
-        self.root = MarkovNode(
+        self.root = EntropyTrackingNode(
             parent=None,
             symbol=None,
             N=0,
@@ -231,8 +232,6 @@ class MarkovModel(object):
         self.gamma = gamma
         self.vocab_prior = vocab_prior
         self.max_nodes = max_nodes
-        self.start_symbol = start_symbol
-        self.stop_symbol = stop_symbol
         self.node_list = [self.root]
 
         self.xent_predictors = [
@@ -264,54 +263,46 @@ class MarkovModel(object):
         self.node_list = new_node_list
 
     def update(
-            self, 
-            seq, 
-            amount=1,
-            inject_start=True,
-            inject_stop=True,
+            self,
+            seq,
             auto_prune=True,
         ):
-        #import pdb; pdb.set_trace()
-
         subseq_len = self.order + 1
-        if inject_start:
-            subseq = [self.start_symbol] + list(seq[:subseq_len-1])
-            self.root.update(subseq, amount=amount, node_list=self.node_list)
-
-        for i in range(len(seq) - self.order -1):
+        #every position starts one window, windows near the end of the
+        #sequence are truncated so that every n-gram is counted exactly once
+        for i in range(len(seq)):
             subseq = seq[i:i+subseq_len]
-            next_symbol = seq[i+subseq_len]
 
-            condition_nodes = self.get_condition_candidates(subseq, max_lookback=self.order)
-            condition_feats = self.calculate_condition_features(condition_nodes)
-            
-            p_of_actual = []
-            for context_depth, cnode in enumerate(condition_nodes):
-                extension_node = cnode.get(next_symbol)
-                if extension_node is None:
-                    extension_count = 0
-                else:
-                    extension_count = extension_node.N
-                vsize = cnode.vocab_prior
-                cprob = (extension_count + cnode.gamma/vsize)/cnode.neff
-                p_of_actual.append(cprob)
-            
-            #for xepredictor, cx, cp in zip(self.xent_predictors, condition_feats, p_of_actual):
-            for cx, cp in zip(condition_feats, p_of_actual):
-                xepredictor = self.xent_predictors[0]
-                xepredictor.update(cx, -1.0*logfn(cp))
+            if i + subseq_len < len(seq):
+                #train the cross entropy predictor on the symbol following
+                #the window before any window containing it has been counted
+                next_symbol = seq[i+subseq_len]
+                self._update_xent_predictor(subseq, next_symbol)
 
-            self.root.update(subseq, amount=amount, node_list=self.node_list)
+            self.root.update(subseq, node_list=self.node_list)
 
-        if inject_stop:
-            for i in range(len(seq) - self.order, len(seq)):
-                partial_seq = list(seq[i:])
-                npad = subseq_len - len(partial_seq)
-                subseq = partial_seq + [self.stop_symbol for j in range(npad)]
-                self.root.update(subseq, amount=amount, node_list=self.node_list)
-        
         if auto_prune and len(self.node_list) > self.max_nodes:
             self.prune()
+
+    def _update_xent_predictor(self, subseq, next_symbol):
+        condition_nodes = self.get_condition_candidates(subseq, max_lookback=self.order)
+        condition_feats = self.calculate_condition_features(condition_nodes)
+
+        p_of_actual = []
+        for context_depth, cnode in enumerate(condition_nodes):
+            extension_node = cnode.get(next_symbol)
+            if extension_node is None:
+                extension_count = 0
+            else:
+                extension_count = extension_node.N
+            vsize = cnode.vocab_prior
+            cprob = (extension_count + cnode.gamma/vsize)/cnode.neff
+            p_of_actual.append(cprob)
+
+        #for xepredictor, cx, cp in zip(self.xent_predictors, condition_feats, p_of_actual):
+        for cx, cp in zip(condition_feats, p_of_actual):
+            xepredictor = self.xent_predictors[0]
+            xepredictor.update(cx, -1.0*logfn(cp))
 
     def walk_tree(self, seq):
         leaf = self.root
@@ -334,7 +325,7 @@ class MarkovModel(object):
         ):
         conditions = [self.root]
 
-        for lookback in range(1, min(len(seq), max_lookback)):
+        for lookback in range(1, min(len(seq), max_lookback)+1):
             prefix_seq = seq[-lookback:]
             candidate_node = self.walk_tree(prefix_seq)
             if (candidate_node is None):
@@ -363,20 +354,10 @@ class MarkovModel(object):
     def calc_probs(
             self, 
             seq,
-            inject_start=True,
-            inject_stop=True,
             max_lookback=None,
         ):
         if max_lookback is None:
             max_lookback = self.order
-
-        if inject_start:
-            if not seq[0] == self.start_symbol:
-                seq.insert(0, self.start_symbol)
-        
-        if inject_stop:
-            if not seq[-1] == self.stop_symbol:
-                seq.append(self.stop_symbol)
 
         probs = []
         for i in range(len(seq)):
