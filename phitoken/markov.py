@@ -100,20 +100,111 @@ def count_subtree_nodes(root):
     return sum(1 for _ in iter_nodes(root))
 
 
+#################
+# pruning
+#
+# Pruning keeps the tree consistent: the N of every removed node is
+# subtracted from the N of all of its ancestors up to and including root,
+# so the children of every node still sum to its continuation_count. Nodes
+# whose N drops to 0 are removed as well. root should be the root of the
+# whole tree, since nodes above it are not decremented.
+
+
+def _subtract_removed_counts(nodes, parents, removed_counts):
+    """Subtract removed counts from each node and all of its ancestors,
+    removing the nodes whose N drops to 0. Returns the number of nodes
+    removed.
+
+    nodes are in preorder (parents before children), parents[i] is
+    (index of the parent, symbol) of nodes[i] (None for root) and
+    removed_counts[i] is the count removed from directly below nodes[i]."""
+    n_emptied = 0
+    for i in range(len(nodes) - 1, -1, -1):
+        removed = removed_counts[i]
+        if not removed:
+            continue
+        node = nodes[i]
+        node.N -= removed
+        if parents[i] is None:
+            continue
+        parent_index, symbol = parents[i]
+        removed_counts[parent_index] += removed
+        if node.N <= 0:
+            del nodes[parent_index].children[symbol]
+            n_emptied += 1
+    return n_emptied
+
+
 def prune_subtree_by_count(root, min_count):
     """Remove every node (and its subtree) with N < min_count. Returns the
     number of nodes removed."""
     n_removed = 0
-    stack = [root]
+    nodes, parents, removed_counts = [], [], []
+    stack = [(root, None)]
     while stack:
-        node = stack.pop()
+        node, parent = stack.pop()
+        index = len(nodes)
+        nodes.append(node)
+        parents.append(parent)
+        removed_counts.append(0)
         for symbol in list(node.children):
             child = node.children[symbol]
             if child.N < min_count:
                 del node.children[symbol]
                 n_removed += count_subtree_nodes(child)
+                removed_counts[index] += child.N
             else:
-                stack.append(child)
+                stack.append((child, (index, symbol)))
+    n_removed += _subtract_removed_counts(nodes, parents, removed_counts)
+    return n_removed
+
+
+def prune_leaves(root, max_count=1):
+    """Remove every leaf below root with N <= max_count. Nodes which become
+    leaves are kept until the next call unless their N drops to 0. Returns
+    the number of nodes removed."""
+    n_removed = 0
+    nodes, parents, removed_counts = [], [], []
+    stack = [(root, None)]
+    while stack:
+        node, parent = stack.pop()
+        index = len(nodes)
+        nodes.append(node)
+        parents.append(parent)
+        removed_counts.append(0)
+        for symbol in list(node.children):
+            child = node.children[symbol]
+            if (not child.children) and child.N <= max_count:
+                del node.children[symbol]
+                n_removed += 1
+                removed_counts[index] += child.N
+            else:
+                stack.append((child, (index, symbol)))
+    n_removed += _subtract_removed_counts(nodes, parents, removed_counts)
+    return n_removed
+
+
+def prune_to_size(root, max_nodes, n_nodes=None):
+    """Misra-Gries style pruning, remove all leaves with N == 1 and repeat
+    until the tree has at most max_nodes nodes. If a pass removes nothing,
+    the threshold is raised to the smallest leaf count.
+
+    n_nodes is the current number of nodes in the tree, counted if not
+    given. Returns the number of nodes removed."""
+    if max_nodes < 1:
+        raise ValueError("max_nodes must be at least 1")
+    if n_nodes is None:
+        n_nodes = count_subtree_nodes(root)
+    n_removed = 0
+    max_count = 1
+    while n_nodes - n_removed > max_nodes:
+        n_pass = prune_leaves(root, max_count)
+        if n_pass == 0:
+            max_count = min(
+                node.N for node in iter_nodes(root)
+                if (node is not root) and not node.children
+            )
+        n_removed += n_pass
     return n_removed
 
 
@@ -305,8 +396,8 @@ class InterpolatedEstimator(object):
     longest matching prefix.
 
     The children's N are assumed to sum to the continuation_count of their
-    parent, which holds for trees filled by MarkovNode.update and is what
-    makes the probabilities sum to 1.
+    parent, which holds for trees filled by MarkovNode.update and pruned by
+    the pruning functions here, and is what makes the probabilities sum to 1.
 
     discount = 0 gives a hierarchical Dirichlet (additive smoothing towards
     the shorter context), concentration = 0 gives pure interpolated absolute
@@ -403,6 +494,7 @@ class MarkovModel(object):
         root=None,
         subsequence_sampler=None,
         probability_estimator=None,
+        max_nodes=None,
     ):
         """
         root: MarkovNode, optional
@@ -413,6 +505,10 @@ class MarkovModel(object):
           NovelSubsequenceSampler on root.
         probability_estimator: optional
           by default a LongestMatchingPrefixEstimator on root.
+        max_nodes: int, optional
+          if given, whenever an update makes the tree grow past max_nodes
+          nodes it is pruned with prune_to_size. Only nodes created by this
+          model's updates are tracked, the tree is recounted before pruning.
 
         A sampler or estimator which looks at the tree should be built on the
         same root.
@@ -423,17 +519,34 @@ class MarkovModel(object):
             subsequence_sampler = NovelSubsequenceSampler(root)
         if probability_estimator is None:
             probability_estimator = LongestMatchingPrefixEstimator(root)
+        if (max_nodes is not None) and max_nodes < 1:
+            raise ValueError("max_nodes must be at least 1")
         self.root = root
         self.subsequence_sampler = subsequence_sampler
         self.probability_estimator = probability_estimator
+        self.max_nodes = max_nodes
+        self.n_nodes = None if max_nodes is None else count_subtree_nodes(root)
 
     def update(self, seq):
-        """Count the sampled subsequences of seq. Returns the number of newly
-        created nodes."""
+        """Count the sampled subsequences of seq, pruning whenever the tree
+        grows past max_nodes. Returns the number of newly created nodes."""
         n_created = 0
         for subseq in self.subsequence_sampler(seq):
-            n_created += self.root.update(subseq)
+            n_new = self.root.update(subseq)
+            n_created += n_new
+            if self.max_nodes is not None:
+                self.n_nodes += n_new
+                if self.n_nodes > self.max_nodes:
+                    self.prune()
         return n_created
+
+    def prune(self):
+        """Prune the tree down to max_nodes nodes. Returns the number of
+        removed nodes."""
+        n_nodes = count_subtree_nodes(self.root)
+        n_removed = prune_to_size(self.root, self.max_nodes, n_nodes)
+        self.n_nodes = n_nodes - n_removed
+        return n_removed
 
     def calc_probs(self, seq):
         return self.probability_estimator.calc_probs(seq)

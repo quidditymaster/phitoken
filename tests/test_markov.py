@@ -1,7 +1,13 @@
 import pytest
 
 import phitoken as phit
-from phitoken.markov import count_subtree_nodes, iter_nodes, prune_subtree_by_count
+from phitoken.markov import (
+    count_subtree_nodes,
+    iter_nodes,
+    prune_leaves,
+    prune_subtree_by_count,
+    prune_to_size,
+)
 
 
 def tree_from(seqs):
@@ -62,14 +68,93 @@ def test_iter_and_count_nodes():
     assert len(list(iter_nodes(root.walk("a")))) == 3
 
 
+def assert_consistent(root):
+    for node in iter_nodes(root):
+        assert node.children_total() == node.continuation_count
+
+
 def test_prune_subtree_by_count():
     root = tree_from(["ab", "ab", "ac", "d"])
     assert prune_subtree_by_count(root, 2) == 2
     assert root.walk("ac") is None
     assert root.walk("d") is None
     assert root.walk("ab").N == 2
-    #counts of the remaining nodes are left alone
+    #removed counts are subtracted from every ancestor
+    assert root.walk("a").N == 2
+    assert root.N == 2
+    assert_consistent(root)
+
+
+def test_prune_subtree_by_count_removes_whole_subtrees():
+    root = tree_from(["abc", "abd", "ab", "x"])
+    assert prune_subtree_by_count(root, 4) == 5
+    assert root.children == {}
+    assert root.N == 0
+
+
+def test_prune_leaves():
+    root = tree_from(["abc", "abc", "abd", "ab", "e"])
+    assert prune_leaves(root) == 2
+    assert root.walk("abd") is None
+    assert root.walk("e") is None
+    assert root.walk("abc").N == 2
+    assert (root.walk("ab").N, root.walk("ab").terminal_count) == (3, 1)
     assert root.walk("a").N == 3
+    assert root.N == 3
+    assert_consistent(root)
+
+
+def test_prune_leaves_only_removes_original_leaves():
+    root = tree_from(["abc", "ab", "a", "a"])
+    assert prune_leaves(root) == 1
+    #"ab" became a leaf with count 1 but is kept until the next call
+    ab = root.walk("ab")
+    assert (ab.N, ab.terminal_count, ab.children) == (1, 1, {})
+    assert root.walk("a").N == 3
+    assert prune_leaves(root) == 1
+    assert root.walk("ab") is None
+    assert root.N == 2
+    assert_consistent(root)
+
+
+def test_prune_leaves_removes_nodes_whose_count_drops_to_zero():
+    root = tree_from(["abc", "d", "d"])
+    assert prune_leaves(root) == 3
+    assert list(root.children) == ["d"]
+    assert root.N == 2
+    assert_consistent(root)
+
+
+def test_prune_leaves_max_count():
+    root = tree_from(["a", "a", "b", "b", "b"])
+    assert prune_leaves(root, max_count=2) == 1
+    assert list(root.children) == ["b"]
+    assert root.N == 3
+
+
+def test_prune_to_size():
+    root = tree_from(["abc", "abc", "abd", "e", "f", "f"])
+    assert count_subtree_nodes(root) == 7
+    #the first pass removes abd and e
+    assert prune_to_size(root, 6) == 2
+    assert count_subtree_nodes(root) == 5
+    assert_consistent(root)
+
+
+def test_prune_to_size_raises_threshold_when_no_leaf_has_count_one():
+    root = tree_from(["a"]*5 + ["b"]*3)
+    assert prune_to_size(root, 2) == 1
+    assert list(root.children) == ["a"]
+    assert root.N == 5
+    with pytest.raises(ValueError):
+        prune_to_size(root, 0)
+
+
+def test_prune_to_size_down_to_root():
+    root = tree_from(["abc", "abc", "d"])
+    prune_to_size(root, 1)
+    assert root.children == {}
+    assert root.N == 0
 
 
 #################
@@ -346,6 +431,33 @@ def test_models_can_share_a_root():
     smooth_probs = smooth.calc_probs("abra")
     assert len(rough_probs) == len(smooth_probs) == 4
     assert smooth_probs != rough_probs
+
+
+def test_model_max_nodes_bounds_tree_size():
+    model = phit.MarkovModel(max_nodes=20)
+    text = "the quick brown fox jumps over the lazy dog "*20
+    model.update(text)
+    assert count_subtree_nodes(model.root) <= 20
+    assert model.n_nodes == count_subtree_nodes(model.root)
+    assert_consistent(model.root)
+    est = phit.InterpolatedEstimator(model.root)
+    alphabet = list(model.root.children)
+    for context in ["", "th", "the qu"]:
+        assert sum(est.prob(context, s) for s in alphabet) == pytest.approx(1.0)
+
+
+def test_model_without_max_nodes_does_not_prune():
+    model = phit.MarkovModel()
+    text = "the quick brown fox jumps over the lazy dog "*20
+    model.update(text)
+    assert model.n_nodes is None
+    assert count_subtree_nodes(model.root) > 20
+    assert_consistent(model.root)
+
+
+def test_model_bad_max_nodes():
+    with pytest.raises(ValueError):
+        phit.MarkovModel(max_nodes=0)
 
 
 def test_readme_style_cell_slicing():
