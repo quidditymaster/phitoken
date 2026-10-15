@@ -211,6 +211,101 @@ def test_smoothing_must_be_positive():
 
 
 #################
+# InterpolatedEstimator
+
+def test_interpolated_hand_computed():
+    #root.N=5, root children a:3 b:1 c:1, a children b:2 c:1
+    root = tree_from(["ab", "ab", "ac", "b", "c"])
+    est = phit.InterpolatedEstimator(root, discount=0.5, concentration=1.0)
+    p_root = ((1 - 0.5) + (1 + 0.5*3)*(1/3))/(5 + 1)
+    assert est.prob([], "b") == pytest.approx(p_root)
+    p_a = ((2 - 0.5) + (1 + 0.5*2)*p_root)/(3 + 1)
+    assert est.prob(["a"], "b") == pytest.approx(p_a)
+    assert est.calc_probs(["a", "b"]) == pytest.approx([est.prob([], "a"), p_a])
+
+
+@pytest.mark.parametrize("discount, concentration", [
+    (0.75, 1.0), (0.0, 0.5), (1.0, 0.0), (0.5, -0.25), ([0.1, 0.9], [2.0, 0.3, 0.0]),
+])
+def test_interpolated_probs_sum_to_one(discount, concentration):
+    model = phit.MarkovModel(subsequence_sampler=phit.SlidingWindowSampler(width=4))
+    model.update("abracadabra cadabra abba")
+    est = phit.InterpolatedEstimator(model.root, discount=discount, concentration=concentration)
+    alphabet = list(model.root.children)
+    for context in ["", "a", "ab", "abr", "zab", "dab", "abba", "q"]:
+        assert sum(est.prob(context, s) for s in alphabet) == pytest.approx(1.0)
+
+
+def test_interpolated_with_vocab_size_leaves_mass_for_unseen_symbols():
+    root = tree_from(["ab", "ab", "ac", "b", "c"])
+    est = phit.InterpolatedEstimator(root, vocab_size=5)
+    for context in [[], ["a"]]:
+        seen = sum(est.prob(context, s) for s in "abc")
+        unseen = est.prob(context, "z")
+        assert unseen > 0
+        assert seen + 2*unseen == pytest.approx(1.0)
+
+
+def test_interpolated_without_discount_at_root_is_additive_smoothing():
+    root = tree_from(["ab", "ab", "ac", "b", "c"])
+    interp = phit.InterpolatedEstimator(root, discount=0.0, concentration=2.0)
+    longest = phit.LongestMatchingPrefixEstimator(root, smoothing=2.0)
+    for s in "abcz":
+        assert interp.prob([], s) == pytest.approx(longest.prob([], s))
+
+
+def test_interpolated_per_depth_parameters():
+    est = phit.InterpolatedEstimator(phit.MarkovNode(), discount=[0.1, 0.2], concentration=[3.0])
+    assert est.parameters(0) == (0.1, 3.0)
+    assert est.parameters(1) == (0.2, 3.0)
+    #the last values are used for every deeper context
+    assert est.parameters(7) == (0.2, 3.0)
+
+
+def test_interpolated_uses_every_matching_depth():
+    root = tree_from(["abc", "abd", "bd", "bd"])
+    est = phit.InterpolatedEstimator(root, max_context=1)
+    deep = phit.InterpolatedEstimator(root)
+    #with one symbol of context "ab" is not used
+    assert est.prob("ab", "c") == pytest.approx(deep.prob("b", "c"))
+    assert deep.prob("ab", "c") > deep.prob("b", "c")
+    #an unmatched longer context passes the shorter context's estimate through
+    assert deep.prob("xb", "c") == pytest.approx(deep.prob("b", "c"))
+
+
+def test_interpolated_empty_tree():
+    est = phit.InterpolatedEstimator(phit.MarkovNode())
+    assert est.calc_probs(["a"]) == [1.0]
+    assert est.calc_probs([]) == []
+
+
+def test_interpolated_bad_parameters():
+    root = phit.MarkovNode()
+    with pytest.raises(ValueError):
+        phit.InterpolatedEstimator(root, discount=1.5)
+    with pytest.raises(ValueError):
+        phit.InterpolatedEstimator(root, discount=-0.1)
+    with pytest.raises(ValueError):
+        phit.InterpolatedEstimator(root, discount=0.5, concentration=-0.5)
+    with pytest.raises(ValueError):
+        phit.InterpolatedEstimator(root, discount=[0.5, 0.0], concentration=-0.25)
+    with pytest.raises(ValueError):
+        phit.InterpolatedEstimator(root, discount=[])
+    with pytest.raises(ValueError):
+        phit.InterpolatedEstimator(root, vocab_size=0)
+
+
+def test_ney_discount():
+    #nodes below the root: a:3, ab:2, ac:1, b:1, c:1  ->  n1=3, n2=1
+    root = tree_from(["ab", "ab", "ac", "b", "c"])
+    assert phit.ney_discount(root) == pytest.approx(3/(3 + 2*1))
+    #a subtree: ab:2, ac:1
+    assert phit.ney_discount(root.walk("a")) == pytest.approx(1/(1 + 2*1))
+    with pytest.raises(ValueError):
+        phit.ney_discount(tree_from(["a", "a", "a"]))
+
+
+#################
 # MarkovModel
 
 def test_model_defaults():

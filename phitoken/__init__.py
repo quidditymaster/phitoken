@@ -11,4 +11,6 @@ from .markov import (
     SlidingWindowSampler,
     NovelSubsequenceSampler,
     LongestMatchingPrefixEstimator,
+    InterpolatedEstimator,
+    ney_discount,
 )

@@ -2,7 +2,10 @@
 
   MarkovNode           the count tree itself, a visit count N and children.
   subsequence samplers decide which subsequences of an input get counted.
-  probability estimators turn the counts in a tree into probabilities.
+  probability estimators turn the counts in a tree into probabilities,
+                       LongestMatchingPrefixEstimator uses the single longest
+                       matching context, InterpolatedEstimator mixes all of
+                       the matching context lengths.
   MarkovModel          ties a root, a sampler and an estimator together.
 
 Several MarkovModels (or estimators) can share the same root, so different
@@ -196,6 +199,43 @@ class NovelSubsequenceSampler(object):
 # symbol of seq given the symbols before it.
 
 
+def matching_context_nodes(root, seq, end, max_context=None):
+    """The nodes for the matching prefixes of seq[end], shortest first.
+
+    The returned list starts with root, followed by the nodes for
+    seq[end-1:end], seq[end-2:end], ... until a prefix is not in the tree or
+    has no observed continuations (or max_context symbols are reached). The
+    last node is the longest matching prefix.
+    """
+    max_length = end
+    if max_context is not None:
+        max_length = min(end, max_context)
+    nodes = [root]
+    for length in range(1, max_length + 1):
+        node = root.walk(seq[end-length:end])
+        if (node is None) or (node.continuation_count <= 0):
+            break
+        nodes.append(node)
+    return nodes
+
+
+def ney_discount(root):
+    """Ney's estimate of the absolute discount, n1/(n1 + 2*n2), where n1 and
+    n2 are the numbers of nodes below root (root itself excluded) with
+    N == 1 and N == 2."""
+    n1 = n2 = 0
+    for node in iter_nodes(root):
+        if node is root:
+            continue
+        if node.N == 1:
+            n1 += 1
+        elif node.N == 2:
+            n2 += 1
+    if n1 + n2 == 0:
+        raise ValueError("no nodes with a count of 1 or 2 to estimate a discount from")
+    return n1/(n1 + 2*n2)
+
+
 class LongestMatchingPrefixEstimator(object):
     """Condition each symbol on the longest matching prefix, the longest run
     of the symbols just before it which is a path in the tree ending at a node
@@ -230,16 +270,7 @@ class LongestMatchingPrefixEstimator(object):
         Prefixes seq[end-1:end], seq[end-2:end], ... are tried in turn until
         one is not in the tree or has no observed continuations, and the last
         valid one is returned (the root if there is none)."""
-        max_length = end
-        if self.max_context is not None:
-            max_length = min(end, self.max_context)
-        best = self.root
-        for length in range(1, max_length + 1):
-            node = self.root.walk(seq[end-length:end])
-            if (node is None) or (node.continuation_count <= 0):
-                break
-            best = node
-        return best
+        return matching_context_nodes(self.root, seq, end, self.max_context)[-1]
 
     def symbol_prob(self, prefix_node, symbol):
         n_symbols = max(1, len(self.root.children))
@@ -254,6 +285,107 @@ class LongestMatchingPrefixEstimator(object):
     def calc_probs(self, seq):
         return [
             self.symbol_prob(self.context_node(seq, i), seq[i])
+            for i in range(len(seq))
+        ]
+
+
+class InterpolatedEstimator(object):
+    """Mix the counts of every matching prefix length, from the root up to
+    the longest matching prefix, by recursively smoothing each context
+    towards the next shorter one (interpolated absolute discounting with a
+    Dirichlet/Pitman-Yor style concentration),
+
+        p_base(s) = 1/vocab_size
+        p_k(s) = (max(c_k(s) - discount_k, 0)
+                  + (concentration_k + discount_k*d_k)*p_{k-1}(s))/(C_k + concentration_k)
+
+    where for the context node of depth k (the root has depth 0) c_k(s) is
+    the N of its child for s, C_k is its continuation_count and d_k is its
+    number of children. The probability of the symbol is p_K(s) for the
+    longest matching prefix.
+
+    The children's N are assumed to sum to the continuation_count of their
+    parent, which holds for trees filled by MarkovNode.update and is what
+    makes the probabilities sum to 1.
+
+    discount = 0 gives a hierarchical Dirichlet (additive smoothing towards
+    the shorter context), concentration = 0 gives pure interpolated absolute
+    discounting.
+    """
+
+    def __init__(self, root, discount=0.75, concentration=1.0, vocab_size=None, max_context=None):
+        """
+        root: MarkovNode
+        discount: float or list of floats
+          the absolute discount, 0 <= discount <= 1. A list gives the discount
+          for each context depth starting with the root, the last value is
+          used for every deeper context.
+        concentration: float or list of floats
+          the weight of the shorter context's prediction, must be greater
+          than -discount at each depth. A list works as for discount.
+        vocab_size: int, optional
+          the number of possible symbols for the uniform base distribution,
+          by default the number of children of the root.
+        max_context: int, optional
+          the maximum number of preceding symbols to match.
+        """
+        self.root = root
+        self.discounts = self._as_list(discount, "discount")
+        self.concentrations = self._as_list(concentration, "concentration")
+        for depth in range(max(len(self.discounts), len(self.concentrations))):
+            discount, concentration = self.parameters(depth)
+            if not (0 <= discount <= 1):
+                raise ValueError("discount must be between 0 and 1")
+            if concentration <= -discount:
+                raise ValueError("concentration must be greater than -discount")
+        if (vocab_size is not None) and vocab_size < 1:
+            raise ValueError("vocab_size must be at least 1")
+        self.vocab_size = vocab_size
+        self.max_context = max_context
+
+    @staticmethod
+    def _as_list(value, name):
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                raise ValueError("{} must not be empty".format(name))
+            return list(value)
+        return [value]
+
+    def parameters(self, depth):
+        """The (discount, concentration) used for a context of length depth."""
+        discount = self.discounts[min(depth, len(self.discounts) - 1)]
+        concentration = self.concentrations[min(depth, len(self.concentrations) - 1)]
+        return discount, concentration
+
+    def context_nodes(self, seq, end):
+        return matching_context_nodes(self.root, seq, end, self.max_context)
+
+    def symbol_prob(self, context_nodes, symbol):
+        """The probability of symbol given the chain of context nodes, root
+        first."""
+        vocab_size = self.vocab_size
+        if vocab_size is None:
+            vocab_size = max(1, len(self.root.children))
+        prob = 1.0/vocab_size
+        for depth, node in enumerate(context_nodes):
+            n_continued = node.continuation_count
+            if n_continued <= 0:
+                #no evidence at this depth, pass the shorter context through
+                continue
+            discount, concentration = self.parameters(depth)
+            child = node.children.get(symbol)
+            symbol_count = 0 if child is None else child.N
+            backoff_weight = concentration + discount*len(node.children)
+            prob = (max(symbol_count - discount, 0) + backoff_weight*prob)/(n_continued + concentration)
+        return prob
+
+    def prob(self, context, symbol):
+        context = list(context)
+        return self.symbol_prob(self.context_nodes(context, len(context)), symbol)
+
+    def calc_probs(self, seq):
+        return [
+            self.symbol_prob(self.context_nodes(seq, i), seq[i])
             for i in range(len(seq))
         ]
 
